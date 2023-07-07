@@ -1,11 +1,37 @@
 import typing
 import time
+import random
+import sys
+import csv
 from multiprocessing import Process, Queue
 
-
+# Define the number of workers we'll be running simultaneously
 number_of_processes_to_simulate = 4
 
+# Define the inputs
+inputs = [random.randint(0,1000) for _ in range(20)]
+
+# Define the csv filename for output
+output_filename = 'output.csv'
+
 MPI_ANY_SOURCE = -1
+
+
+# Recursive function to determine the length of the collatz sequence for a given number
+# See https://en.wikipedia.org/wiki/Collatz_conjecture for more info
+def collatz_sequence_length(n:int):
+    # n=1 has a sequence length of 0 to match the standard formulation
+    if n == 1:
+        return 0    
+    
+    # If n isn't 1, return the length of the next number's collatz sequence plus 1
+    if n % 2:
+        # Odd integer
+        return collatz_sequence_length(3*n + 1) + 1
+    else:
+        # Even integer
+        return collatz_sequence_length(n/2) + 1
+    
 
 def mpi_application(
         rank:int,
@@ -13,38 +39,100 @@ def mpi_application(
         send_f:typing.Callable[[typing.Any,int],None],
         recv_f:typing.Callable[[int], typing.Any]
     ):
-    # NOTE for the assignment you can not specify the reception of a message
-    # from a single source, you only need to receive from any source using:
 
-    # data = recv_f(MPI_ANY_SOURCE)
-
-
-    # NOTE to send a message/data from a process to process with rank 2, you
-    # use:
-
-    # send_f(data,2)
-
-
-    # NOTE ensure the coordinator sends a message to inform each process to
-    # end and the coordinator should end as well.  If the application
-    # does not end, you likely messed this up.
-
-    # TODO implement your MPI application logic here using the parameters above
-    # instead of mpi4py
     if rank == 0:
-        # TODO implement coordinator logic
-        send_f("hello", dest=1)
-        send_f("world", dest=2)
-        send_f("!", dest=3)
+        ## -- Coordinator logic
+
+        # Define a holder for the outputs
+        outputs = []
+
+        # Define a count of how many workers are running at any time.
+        # This lets us handle the edge case where the number of inputs is less 
+        # than the number of workers assigned to the task.
+        workers_running = 0
+
+
+        # Assign all workers an input and add 1 to the workers_running variable, 
+        # or send an 'END' command if there aren't enough inputs for each worker
+        for i in range(size-1):
+            if len(inputs) > 0:
+                send_f(inputs[0], dest=i+1)
+                inputs.pop(0)
+
+                workers_running += 1
+            else:
+                send_f('END', dest=i+1)
+
+
+        # While there are additional inputs send them to whatever worker returns next
+        while len(inputs) > 0:
+            response = recv_f(MPI_ANY_SOURCE)
+
+            # Grab the worker's rank and its output from our custom defined return
+            # (See the worker logic code below)
+            worker_rank = int(response.split(':')[0])
+            worker_output = response.split(':')[1]
+
+            # Record the worker's output
+            outputs.append(worker_output)
+
+            # Send the worker a new input and remove the input from our list
+            send_f(inputs[0], dest=worker_rank)
+            inputs.pop(0)
+
+
+        # All inputs have been assigned, so wait for all the running workers to return
+        for i in range(workers_running):
+            response = recv_f(MPI_ANY_SOURCE)
+            
+            # Grab the worker's rank and its output from our custom defined return
+            # (See the worker logic code below)
+            worker_rank = int(response.split(':')[0])
+            worker_output = response.split(':')[1]
+
+            # Record the worker's output
+            outputs.append(worker_output)
+
+            # Stop the worker from continuing to listen
+            send_f('END', dest=worker_rank)
+
+
+        workers_running = 0 # Unnecessary, but good to remember
+
+
+        print(outputs)
         
-        for _ in range(1, size):
-            print(recv_f(MPI_ANY_SOURCE))
+
+        # Write the outputs to a csv
+        fields = ['Number', 'Length of Collatz Sequence']
+        rows = [ [output.split(',')[0], output.split(',')[1]] for output in outputs]
+
+        with open(output_filename, 'w', newline = '') as file:
+            csv.writer(file).writerow(fields)
+            csv.writer(file).writerows(rows)
+
+
     else:
-        # TODO implement worker logic
-        d = recv_f(MPI_ANY_SOURCE)
-        print(f"{d} received by {rank}")
-        
-        send_f(f"Reply: I, process of rank {rank}, received {d}", dest=0)
+        ## -- Worker logic
+
+        # Listen for instructions from the coordinator
+        while True:
+            d = recv_f(MPI_ANY_SOURCE)
+
+            # For debugging, display the message received
+            print(f"{d} received by {rank}")
+
+            # If the coordinator sent an 'END' message, terminate the worker
+            if d == 'END':
+                break
+            
+            # This sleep adds some reasonable time variance between the workers
+            # to simulate a more realistic environment
+            time.sleep(random.uniform(0,1))
+
+            # Return the workers output in the format required for parsing
+            send_f(f"{rank}:{d},{collatz_sequence_length(d)}", dest=0)
+
 
 
 ###############################################################################
@@ -100,4 +188,8 @@ def _simulate_mpi(n:int, app_f):
 
 
 if __name__ == "__main__":
+    # The collatz sequence occasionally exceeds python's default recursion limit
+    # of 1000, so we increase the limit
+    sys.setrecursionlimit(100_000_000)
+
     _simulate_mpi(number_of_processes_to_simulate, mpi_application)
